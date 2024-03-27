@@ -1,0 +1,289 @@
+---
+
+- hosts: all
+  gather_facts: no
+  # vars_files:
+  #   - db_credentials.yml
+  vars:
+      host: bukva-lib.ru
+      ansible_user: andrew
+      django_db_name: library
+      django_db_user: librarian
+      django_db_password: 1234567890
+      LANGUAGE_CODE: ru
+      GIT_BRANCH: deploy_version
+      HOST_IP: 5.35.94.115
+      ADMIN_NAME: tg3381234 # Put your gmail without @gmail
+      ADMIN_PW: Aa700107073
+
+  tasks:
+    - name: Ensure user exists
+      become: yes
+      user:
+        name: andrew
+        state: present
+        create_home: yes
+
+    - name: Get user details
+      ansible.builtin.getent:
+        database: passwd
+        key: andrew
+      register: user_info
+
+    - name: Display user details
+      debug:
+        var: user_info
+
+    - name: Deadsnakes PPA to get Python 3
+      become: yes
+      apt_repository:
+        repo: 'ppa:deadsnakes/ppa'
+        state: present
+        update_cache: yes
+
+    - name: Make sure required packages are installed
+      become: yes
+      apt: 
+        pkg: [
+          'nginx', 'git', 'python3', 'python3-venv', 'gettext', 
+          'postgresql', 'postgresql-contrib', 'python3-pip', 
+          'libpq-dev', 'postgresql-server-dev-all', 'python3-certbot-nginx', 'certbot']
+        state: present
+        update_cache: yes
+
+    - name: Create a directory for the site
+      become: yes
+      file:
+        path: "/home/{{ ansible_user }}/sites/{{ host }}"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+
+    - name: Add Git exception for the repository
+      become: yes
+      become_user: "{{ ansible_user }}"
+      ansible.builtin.command:
+        cmd: git config --global --add safe.directory /home/{{ ansible_user }}/sites/{{ host }}
+
+    - name: Change ownership of .git directory
+      become: yes
+      file:
+        path: "/home/{{ ansible_user }}/sites/{{ host }}/.git"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        recurse: yes
+
+    - name: Remove existing site directory if it exists
+      become: yes
+      ansible.builtin.file:
+        path: "/home/{{ ansible_user }}/sites/{{ host }}"
+        state: absent
+
+    - name: Download code from GitHub
+      ansible.builtin.git:
+        repo: https://github.com/Killman03/mylibsite.git
+        dest: /home/{{ ansible_user }}/sites/{{ host }}
+        version: "{{ GIT_BRANCH }}"
+        clone: yes
+        update: yes
+
+    - name: Install dependencies
+      pip:
+        requirements: /home/{{ ansible_user }}/sites/{{ host }}/requirements.txt
+        virtualenv: /home/{{ ansible_user }}/sites/{{ host }}/venv/
+        virtualenv_command: /usr/bin/python3 -m venv
+
+    - name: Check if the database exists
+      become: yes
+      shell: sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='library'"
+      register: db_exists
+      failed_when: db_exists.stdout != "1" and db_exists.stdout != ""
+
+    - name: Create a database using shell
+      become: yes
+      shell: sudo -u postgres psql -c "CREATE DATABASE library"
+      when: db_exists.stdout != "1"
+
+      # vars:
+      #   ansible_python_interpreter: "/home/{{ ansible_user }}/sites/{{ host }}/venv/bin/python"
+
+    - name: Create a database user
+      become: yes
+      shell: |
+        sudo -u postgres psql -c "CREATE USER {{ django_db_user }} WITH PASSWORD '{{ django_db_password }}';"
+        sudo -u postgres psql -c "ALTER USER {{ django_db_user }} WITH SUPERUSER;"
+      args:
+        executable: /bin/bash
+
+    - name: Change ownership and permissions of manage.py
+      become: yes
+      file:
+        path: "/home/{{ ansible_user }}/sites/{{ host }}/manage.py"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+
+    - name: Check if PostgreSQL is running
+      become: yes
+      shell: pg_isready
+      register: pg_status
+      failed_when: pg_status.stdout != "/var/run/postgresql:5432 - accepting connections"
+
+    - name: Print PostgreSQL status
+      debug:
+        msg: "{{ pg_status.stdout }}"
+
+    - name: Run migrations
+      community.general.django_manage:
+        command: migrate
+        project_path: "/home/{{ ansible_user }}/sites/{{ host }}"
+        virtualenv: "/home/{{ ansible_user }}/sites/{{ host }}/venv"
+
+    - name: Collect Static Files
+      community.general.django_manage:
+        command: collectstatic --noinput
+        project_path: "/home/{{ ansible_user }}/sites/{{ host }}"
+        virtualenv: "/home/{{ ansible_user }}/sites/{{ host }}/venv"
+      tags:
+        - static
+
+    - name: Check if django superuser exists
+      django_manage:
+        virtualenv: "/home/{{ ansible_user }}/sites/{{ host }}/venv"
+        app_path: "/home/{{ ansible_user }}/sites/{{ host }}"
+        command: shell -c 'import sys; from django.contrib.auth.models import User; sys.exit(0 if User.objects.filter(username="{{ ADMIN_NAME }}").count() > 0 else 1)'
+      register: checksuperuser
+      ignore_errors: True
+#      tags:
+#        - superuser
+
+    - name: Create an initial superuser
+      community.general.django_manage:
+        command: "createsuperuser --noinput --username={{ ADMIN_NAME }} --email={{ ADMIN_NAME }}@gmail.com --password={{ ADMIN_NAME }}"
+        project_path: "/home/{{ ansible_user }}/sites/{{ host }}"
+        virtualenv: "/home/{{ ansible_user }}/sites/{{ host }}/venv"
+      ignore_errors: True
+
+    - name: Set superuser password
+      community.general.django_manage:
+        command: "shell -c 'from django.contrib.auth import get_user_model; User = get_user_model(); u = User.objects.get(username=\"{{ ADMIN_NAME }}\"); u.set_password(\"{{ ADMIN_PW }}\"); u.save()'"
+        project_path: "/home/{{ ansible_user }}/sites/{{ host }}"
+        virtualenv: "/home/{{ ansible_user }}/sites/{{ host }}/venv"
+      tags:
+        - superuserpw
+
+
+    - name: Add nginx config to sites-available
+      become: yes
+      template: 
+        src: ./sites-available.j2
+        dest: /etc/nginx/sites-available/{{ host }}
+      notify:
+        - Restart nginx
+
+    - name: Add symlink in nginx sites-enabled
+      become: yes
+      file:
+        src: /etc/nginx/sites-available/{{ host }}
+        dest: /etc/nginx/sites-enabled/{{ host }}
+        state: link
+      notify:
+        - Restart nginx
+
+    - name: Install Gunicorn
+      pip:
+        name: gunicorn
+        virtualenv: "/home/{{ ansible_user }}/sites/{{ host }}/venv"
+        virtualenv_command: /usr/bin/python3 -m venv
+
+    - name: Create Gunicorn Socket file
+      template:
+        src: ./gunicorn.socket.j2
+        dest: /etc/systemd/system/gunicorn.socket
+
+    - name: Create Gunicorn Service file
+      template:
+        src: gunicorn.service.j2
+        dest: /etc/systemd/system/gunicorn.service
+
+    - name: Start Gunicorn.socket
+      shell: "/bin/systemctl start gunicorn.socket"
+
+    - name: Enable Gunicorn.socket
+      shell: "/bin/systemctl enable gunicorn.socket"
+
+    #    - name: Write gunicorn service script
+#      become: yes
+#      template:
+#        src: ./gunicorn.j2
+#        dest: /etc/systemd/system/gunicorn-{{ host }}.service
+#      notify:
+#        - Restart gunicorn
+#      tags:
+#        - gunicorn
+
+
+
+#    - name: Compile translation files
+#      community.general.django_manage:
+#        command: compilemessages --ignore="venv/*"
+#        project_path: "/home/{{ ansible_user }}/sites/{{ host }}"
+#        virtualenv: "/home/{{ ansible_user }}/sites/{{ host }}/venv"
+#
+#    - name: Create .env file
+#      template:
+#        src: ./dotenv.j2
+#        dest: /home/{{ ansible_user }}/sites/{{ host }}/.env
+#      tags:
+#        - dotenv
+#
+#    - name: Add environment variables to .env
+#      blockinfile:
+#        path: /home/{{ ansible_user }}/sites/{{ host }}/.env
+#        block: |
+#          DJANGO_SECRET_KEY="{{ lookup('password', '/dev/null') }}"
+#          DJANGO_DATABASE_PASSWORD="{{ django_db_password }}"
+#          DJANGO_PRODUCTION=true
+#      tags:
+#        - dotenv
+
+    - name: Disable default Nginx site
+      become: yes
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Reload systemd
+      become: yes
+      systemd:
+        daemon_reload: yes
+
+#    - name: Restart Gunicorn service
+#      become: yes
+#      systemd:
+#        name: gunicorn-{{ host }}.service
+#        state: restarted
+#      tags:
+#        - gunicorn
+
+
+    - name: Reload Nginx to apply changes
+      become: yes
+      systemd:
+        name: nginx
+        state: reloaded
+
+  handlers:
+    - name: Restart nginx
+      service:
+        name: nginx
+        state: restarted
+
+    - name: Restart gunicorn
+      systemd:
+        name: gunicorn-{{ host }}
+        daemon_reload: yes
+        enabled: yes
+        state: restarted
